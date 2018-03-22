@@ -48,6 +48,10 @@ typedef struct
 	 */
 	bool		include_lsn;		/* include LSNs */
 
+	bool 		is_output_plugin_wrote;
+	char		*filter_tables;
+
+
 	uint64		nr_changes;			/* # of passes in pg_decode_change() */
 									/* FIXME replace with txn->nentries */
 } JsonDecodingData;
@@ -68,6 +72,9 @@ static void pg_decode_message(LogicalDecodingContext *ctx,
 					bool transactional, const char *prefix,
 					Size content_size, const char *content);
 #endif
+
+/* example: -o filter-tables=schemaName1.table1, schemaName2.table2, */
+static bool check_if_table_is_filtered(LogicalDecodingContext *ctx, char *schema_name, char *table_name);
 
 void
 _PG_init(void)
@@ -107,7 +114,7 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 										ALLOCSET_DEFAULT_INITSIZE,
 										ALLOCSET_DEFAULT_MAXSIZE
 #endif
-                                        );
+										);
 	data->include_xids = false;
 	data->include_timestamp = false;
 	data->include_schemas = true;
@@ -118,6 +125,9 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 	data->write_in_chunks = false;
 	data->include_lsn = false;
 	data->include_not_null = false;
+	data->is_output_plugin_wrote = false;
+
+	data->filter_tables = NULL;
 
 	data->nr_changes = 0;
 
@@ -262,6 +272,13 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
 							 strVal(elem->arg), elem->defname)));
 		}
+		else if (strcmp(elem->defname, "filter-tables") == 0)
+		{
+			if (elem->arg != NULL && strlen(strVal(elem->arg)) != 0)
+			{
+				data->filter_tables = strVal(elem->arg);
+			}
+		}
 		else
 		{
 			ereport(ERROR,
@@ -281,6 +298,11 @@ pg_decode_shutdown(LogicalDecodingContext *ctx)
 
 	/* cleanup our own resources via memory context reset */
 	MemoryContextDelete(data->context);
+
+	if (data->filter_tables != NULL)
+	{
+		pfree(data->filter_tables);
+	}
 }
 
 /* BEGIN callback */
@@ -331,9 +353,6 @@ pg_decode_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 		appendStringInfoString(ctx->out, "\t\"change\": [");
 	else
 		appendStringInfoString(ctx->out, "\"change\":[");
-
-	if (data->write_in_chunks)
-		OutputPluginWrite(ctx, true);
 }
 
 /* COMMIT callback */
@@ -367,7 +386,12 @@ pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		appendStringInfoString(ctx->out, "]}");
 	}
 
-	OutputPluginWrite(ctx, true);
+	if (data->nr_changes > 0)
+	{
+		OutputPluginWrite(ctx, true);
+	}
+
+	data->is_output_plugin_wrote = false;
 }
 
 /*
@@ -776,6 +800,7 @@ static void
 pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				 Relation relation, ReorderBufferChange *change)
 {
+	bool is_table_filtered;
 	JsonDecodingData *data;
 	Form_pg_class class_form;
 	TupleDesc	tupdesc;
@@ -792,9 +817,6 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 	/* Avoid leaking memory by using and resetting our own context */
 	old = MemoryContextSwitchTo(data->context);
-
-	if (data->write_in_chunks)
-		OutputPluginPrepareWrite(ctx, true);
 
 	/* Make sure rd_replidindex is set */
 	RelationGetIndexList(relation);
@@ -860,6 +882,16 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		default:
 			Assert(false);
 	}
+
+	is_table_filtered = check_if_table_is_filtered(ctx, get_namespace_name(class_form->relnamespace), NameStr(class_form->relname));
+	if (is_table_filtered)
+	{
+		if (!data->is_output_plugin_wrote)
+		{
+			if (data->write_in_chunks)
+				OutputPluginWrite(ctx, true);
+			data->is_output_plugin_wrote = true;
+		}
 
 	/* Change counter */
 	data->nr_changes++;
@@ -994,11 +1026,12 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	else
 		appendStringInfoChar(ctx->out, '}');
 
-	MemoryContextSwitchTo(old);
-	MemoryContextReset(data->context);
-
 	if (data->write_in_chunks)
 		OutputPluginWrite(ctx, true);
+	}
+
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(data->context);
 }
 
 #if	PG_VERSION_NUM >= 90600
@@ -1113,3 +1146,36 @@ pg_decode_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		OutputPluginWrite(ctx, true);
 }
 #endif
+
+
+/* example: -o filter-tables=schemaName1.table1, schemaName2.table2, */
+
+static
+bool check_if_table_is_filtered(LogicalDecodingContext *ctx, char *schema_name, char *table_name)
+{
+	JsonDecodingData *data = ctx->output_plugin_private;
+	if (data->filter_tables == NULL)
+	{
+		return true;
+	}
+	else
+	{
+		int delimiters_count = 2;
+		int char_count = strlen(schema_name) + strlen(table_name) + delimiters_count;
+		char buffer[char_count];
+
+		strcpy(buffer, schema_name);
+		strcat(buffer, ".");
+		strcat(buffer, table_name);
+		strcat(buffer, ",");
+
+		if (strstr(data->filter_tables, buffer) != NULL)
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+}
