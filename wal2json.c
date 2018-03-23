@@ -73,7 +73,7 @@ static void pg_decode_message(LogicalDecodingContext *ctx,
 					Size content_size, const char *content);
 #endif
 
-/* example: -o filter-tables=schemaName1.table1, schemaName2.table2 */
+/* example: -o filter-tables=schemaName1.table1, schemaName2.table2, */
 static bool check_if_table_is_filtered(LogicalDecodingContext *ctx, char *schema_name, char *table_name);
 
 void
@@ -276,7 +276,7 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 		{
 			if (elem->arg != NULL && strlen(strVal(elem->arg)) != 0)
 			{
-				data->filter_tables = strcat(strVal(elem->arg), ",");
+				data->filter_tables = strVal(elem->arg);
 			}
 		}
 		else
@@ -1148,7 +1148,7 @@ pg_decode_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 #endif
 
 
-/* example: -o filter-tables=schemaName1.table1, schemaName2.table2 */
+/* example: -o filter-tables=schemaName1.table1, schemaName2.table2, */
 
 static
 bool check_if_table_is_filtered(LogicalDecodingContext *ctx, char *schema_name, char *table_name)
